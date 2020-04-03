@@ -340,8 +340,8 @@ func TestTeamHandleMultipleSeitans(t *testing.T) {
 
 		if bad {
 			// Ruin the acceptance sig so request is no longer valid
-			accepted.sig[0] = accepted.sig[0] ^ 0xF0
-			accepted.sig[1] = accepted.sig[2] ^ 0x0F
+			accepted.sig[0] ^= 0xF0
+			accepted.sig[1] ^= 0x0F
 			accepted.encoded = base64.StdEncoding.EncodeToString(accepted.sig[:])
 		}
 

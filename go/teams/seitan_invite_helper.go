@@ -3,7 +3,6 @@ package teams
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/keybase/client/go/libkb"
 	"github.com/keybase/client/go/protocol/keybase1"
@@ -19,9 +18,9 @@ func ParseAndAcceptSeitanToken(ctx context.Context, g *libkb.GlobalContext, tok 
 	case SeitanVersion1:
 		wasSeitan, err = parseAndAcceptSeitanTokenV1(mctx, tok)
 	case SeitanVersion2:
-		wasSeitan, err = parseAndAcceptSeitanTokenV2(ctx, g, tok)
+		wasSeitan, err = parseAndAcceptSeitanTokenV2(mctx, tok)
 	case SeitanVersionInvitelink:
-		wasSeitan, err = parseAndAcceptSeitanTokenInvitelink(ctx, g, tok)
+		wasSeitan, err = parseAndAcceptSeitanTokenInvitelink(mctx, tok)
 	default:
 		wasSeitan = false
 		err = fmt.Errorf("Unexpected SeitanVersion %d", seitanVersion)
@@ -29,21 +28,7 @@ func ParseAndAcceptSeitanToken(ctx context.Context, g *libkb.GlobalContext, tok 
 	return wasSeitan, err
 }
 
-func parseAndAcceptSeitanTokenV1(mctx libkb.MetaContext, tok string) (wasSeitan bool, err error) {
-	seitan, err := ParseIKeyFromString(tok)
-	if err != nil {
-		mctx.Debug("ParseIKeyFromString error: %s", err)
-		mctx.Debug("returning TeamInviteBadToken instead")
-		return false, libkb.TeamInviteBadTokenError{}
-	}
-	unixNow := mctx.G().Clock().Now().Unix()
-	acpt, err := generateAcceptanceSeitanV1(mctx, seitan, unixNow)
-	if err != nil {
-		return true, err
-	}
-	err = postSeitanV1(mctx, acpt)
-	return true, err
-}
+// Seitan V1:
 
 type acceptedSeitanV1 struct {
 	unixNow  int64
@@ -52,12 +37,7 @@ type acceptedSeitanV1 struct {
 	encoded  string // base64 encoded akey
 }
 
-func generateAcceptanceSeitanV1(mctx libkb.MetaContext, ikey SeitanIKey, unixNow int64) (ret acceptedSeitanV1, err error) {
-	uv := mctx.CurrentUserVersion()
-	if err != nil {
-		return ret, err
-	}
-
+func generateAcceptanceSeitanV1(ikey SeitanIKey, uv keybase1.UserVersion, unixNow int64) (ret acceptedSeitanV1, err error) {
 	sikey, err := ikey.GenerateSIKey()
 	if err != nil {
 		return ret, err
@@ -90,107 +70,138 @@ func postSeitanV1(mctx libkb.MetaContext, acceptedSeitan acceptedSeitanV1) error
 	return err
 }
 
-func parseAndAcceptSeitanTokenV2(ctx context.Context, g *libkb.GlobalContext, tok string) (wasSeitan bool, err error) {
-	seitan, err := ParseIKeyV2FromString(tok)
+func parseAndAcceptSeitanTokenV1(mctx libkb.MetaContext, tok string) (wasSeitan bool, err error) {
+	seitan, err := ParseIKeyFromString(tok)
 	if err != nil {
-		g.Log.CDebugf(ctx, "ParseIKeyV2FromString error: %s", err)
-		g.Log.CDebugf(ctx, "returning TeamInviteBadToken instead")
+		mctx.Debug("ParseIKeyFromString error: %s", err)
+		mctx.Debug("returning TeamInviteBadToken instead")
 		return false, libkb.TeamInviteBadTokenError{}
 	}
-	err = AcceptSeitanV2(ctx, g, seitan)
+	uv := mctx.CurrentUserVersion()
+	unixNow := mctx.G().Clock().Now().Unix()
+	acpt, err := generateAcceptanceSeitanV1(seitan, uv, unixNow)
+	if err != nil {
+		return true, err
+	}
+	err = postSeitanV1(mctx, acpt)
 	return true, err
-
 }
 
-func parseAndAcceptSeitanTokenInvitelink(ctx context.Context, g *libkb.GlobalContext, tok string) (wasSeitan bool, err error) {
-	seitan, err := ParseIKeyInvitelinkFromString(tok)
-	if err != nil {
-		g.Log.CDebugf(ctx, "ParseIKeyInvitelinkFromString error: %s", err)
-		g.Log.CDebugf(ctx, "returning TeamInviteBadToken instead")
-		return false, libkb.TeamInviteBadTokenError{}
-	}
-	err = AcceptSeitanInvitelink(ctx, g, seitan)
-	if err != nil {
-		return false, err
-	}
-	return true, nil
+// Seitan V2:
 
+type acceptedSeitanV2 struct {
+	now      keybase1.Time
+	inviteID SCTeamInviteID
+	sig      SeitanSig
+	encoded  string // base64 encoded sig
 }
 
-func ProcessSeitanV2(ikey SeitanIKeyV2, uv keybase1.UserVersion, kbtime keybase1.Time) (sig string,
-	inviteID SCTeamInviteID, err error) {
-
+func generateAcceptanceSeitanV2(ikey SeitanIKeyV2, uv keybase1.UserVersion, timeNow keybase1.Time) (ret acceptedSeitanV2, err error) {
 	sikey, err := ikey.GenerateSIKey()
 	if err != nil {
-		return sig, inviteID, err
-	}
-
-	inviteID, err = sikey.GenerateTeamInviteID()
-	if err != nil {
-		return sig, inviteID, err
-	}
-
-	_, encoded, err := sikey.GenerateSignature(uv.Uid, uv.EldestSeqno, inviteID, kbtime)
-	if err != nil {
-		return sig, inviteID, err
-	}
-
-	return encoded, inviteID, nil
-}
-
-func AcceptSeitanV2(ctx context.Context, g *libkb.GlobalContext, ikey SeitanIKeyV2) error {
-	mctx := libkb.NewMetaContext(ctx, g)
-	uv, err := g.GetMeUV(ctx)
-	if err != nil {
-		return err
-	}
-
-	now := keybase1.ToTime(time.Now())
-	encoded, inviteID, err := ProcessSeitanV2(ikey, uv, now)
-	if err != nil {
-		return err
-	}
-
-	g.Log.CDebugf(ctx, "seitan invite ID: %v", inviteID)
-
-	arg := apiArg("team/seitan_v2")
-	arg.Args.Add("sig", libkb.S{Val: encoded})
-	arg.Args.Add("now", libkb.HTTPTime{Val: now})
-	arg.Args.Add("invite_id", libkb.S{Val: string(inviteID)})
-	_, err = mctx.G().API.Post(mctx, arg)
-	return err
-}
-
-func AcceptSeitanInvitelink(ctx context.Context, g *libkb.GlobalContext,
-	ikey keybase1.SeitanIKeyInvitelink) error {
-	mctx := libkb.NewMetaContext(ctx, g)
-	uv, err := g.GetMeUV(ctx)
-	if err != nil {
-		return err
-	}
-
-	sikey, err := GenerateSIKeyInvitelink(ikey)
-	if err != nil {
-		return err
+		return ret, err
 	}
 
 	inviteID, err := sikey.GenerateTeamInviteID()
 	if err != nil {
-		return err
+		return ret, err
 	}
 
-	now := time.Now()
-	_, encoded, err := GenerateSeitanInvitelinkAcceptanceKey(sikey[:], uv.Uid, uv.EldestSeqno, now.Unix())
+	sig, encoded, err := sikey.GenerateSignature(uv.Uid, uv.EldestSeqno, inviteID, timeNow)
 	if err != nil {
-		return err
+		return ret, err
 	}
 
-	g.Log.CDebugf(ctx, "seitan invite ID: %v", inviteID)
+	return acceptedSeitanV2{
+		now:      timeNow,
+		inviteID: inviteID,
+		sig:      sig,
+		encoded:  encoded,
+	}, nil
+}
 
-	arg := apiArg("team/seitan_invitelink")
-	arg.Args.Add("akey", libkb.S{Val: encoded})
-	arg.Args.Add("unix_timestamp", libkb.U{Val: uint64(now.Unix())})
-	arg.Args.Add("invite_id", libkb.S{Val: string(inviteID)})
-	_, err = mctx.G().API.Post(mctx, arg)
+func postSeitanV2(mctx libkb.MetaContext, acceptedSeitan acceptedSeitanV2) error {
+	arg := apiArg("team/seitan_v2")
+	arg.Args.Add("sig", libkb.S{Val: acceptedSeitan.encoded})
+	arg.Args.Add("now", libkb.HTTPTime{Val: acceptedSeitan.now})
+	arg.Args.Add("invite_id", libkb.S{Val: string(acceptedSeitan.inviteID)})
+	_, err := mctx.G().API.Post(mctx, arg)
 	return err
+}
+
+func parseAndAcceptSeitanTokenV2(mctx libkb.MetaContext, tok string) (wasSeitan bool, err error) {
+	seitan, err := ParseIKeyV2FromString(tok)
+	if err != nil {
+		mctx.Debug("ParseIKeyV2FromString error: %s", err)
+		mctx.Debug("returning TeamInviteBadToken instead")
+		return false, libkb.TeamInviteBadTokenError{}
+	}
+	uv := mctx.CurrentUserVersion()
+	timeNow := keybase1.ToTime(mctx.G().Clock().Now())
+	acpt, err := generateAcceptanceSeitanV2(seitan, uv, timeNow)
+	if err != nil {
+		return true, nil
+	}
+	err = postSeitanV2(mctx, acpt)
+	return true, err
+
+}
+
+// Seitan V3 (Seitan Invite Link):
+
+type acceptedSeitanInviteLink struct {
+	unixNow  int64
+	inviteID SCTeamInviteID
+	akey     SeitanAKey
+	encoded  string // base64 encoded akey
+}
+
+func generateAcceptanceSeitanInviteLink(ikey keybase1.SeitanIKeyInvitelink, uv keybase1.UserVersion, unixNow int64) (ret acceptedSeitanInviteLink, err error) {
+	sikey, err := GenerateSIKeyInvitelink(ikey)
+	if err != nil {
+		return ret, err
+	}
+
+	inviteID, err := sikey.GenerateTeamInviteID()
+	if err != nil {
+		return ret, err
+	}
+
+	akey, encoded, err := GenerateSeitanInvitelinkAcceptanceKey(sikey[:], uv.Uid, uv.EldestSeqno, unixNow)
+	if err != nil {
+		return ret, err
+	}
+
+	return acceptedSeitanInviteLink{
+		unixNow:  unixNow,
+		inviteID: inviteID,
+		akey:     akey,
+		encoded:  encoded,
+	}, nil
+}
+
+func postSeitanInviteLink(mctx libkb.MetaContext, acceptedSeitan acceptedSeitanInviteLink) error {
+	arg := apiArg("team/seitan_invitelink")
+	arg.Args.Add("akey", libkb.S{Val: acceptedSeitan.encoded})
+	arg.Args.Add("unix_timestamp", libkb.I64{Val: acceptedSeitan.unixNow})
+	arg.Args.Add("invite_id", libkb.S{Val: string(acceptedSeitan.inviteID)})
+	_, err := mctx.G().API.Post(mctx, arg)
+	return err
+}
+
+func parseAndAcceptSeitanTokenInvitelink(mctx libkb.MetaContext, tok string) (wasSeitan bool, err error) {
+	seitan, err := ParseIKeyInvitelinkFromString(tok)
+	if err != nil {
+		mctx.Debug("ParseIKeyInvitelinkFromString error: %s", err)
+		mctx.Debug("returning TeamInviteBadToken instead")
+		return false, libkb.TeamInviteBadTokenError{}
+	}
+	uv := mctx.CurrentUserVersion()
+	unixNow := mctx.G().Clock().Now().Unix()
+	acpt, err := generateAcceptanceSeitanInviteLink(seitan, uv, unixNow)
+	if err != nil {
+		return true, err
+	}
+	err = postSeitanInviteLink(mctx, acpt)
+	return true, err
 }
